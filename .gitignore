@@ -23,11 +23,10 @@ yarn.lock
 bun.lock
 
 # Firebase Admin SDK key
-sigapp-dev-firebase-adminsdk.json
-*.json
+*firebase-adminsdk.json
 
 # Migration checkpoint files
-checkpoint.json
+*checkpoint.json*
 failed.jsonl
 
 # Build outputs

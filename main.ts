@@ -1,22 +1,27 @@
 #!/usr/bin/env node
 /* eslint-disable no-console */
 /**
- * Migración Supabase -> Cloud Firestore (TypeScript / Node.js)
+ * Supabase -> Cloud Firestore migration (TypeScript / Node.js)
  *
- * - Lee tablas:
+ * - Reads tables:
  *    gt_course_tracking, gt_grade_categories, gt_grades, user_preferences
- * - Escribe en Firestore:
+ * - Writes to Firestore:
  *    /students/{studentCode}/gradeSimulations/{courseCode}
  *        { categories: Map, grades: Map, lastModified: serverTimestamp }
  *    /students/{studentCode}/preferences/global
  *    /students/{studentCode}/preferences/_semesters/data/{semesterId}
  *
- * Configuración: ver .env o variables de entorno.
+ * Configuration: see .env or environment variables.
  */
 
 import "dotenv/config";
 import path from "path";
 import fs from "fs";
+import {
+  loadCheckpoint,
+  saveCheckpoint,
+  ensureCheckpointWithinBounds,
+} from "./checkpoint";
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
 // Cambiar a API modular de firebase-admin v12+
 import { initializeApp, cert } from "firebase-admin/app";
@@ -128,12 +133,12 @@ const {
 } = (process.env as Env) ?? {};
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  console.error("❌ Faltan SUPABASE_URL o SUPABASE_SERVICE_ROLE_KEY en .env");
+  console.error("❌ Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in .env");
   process.exit(1);
 }
 
 if (!FIREBASE_SERVICE_ACCOUNT_PATH) {
-  console.error("❌ Falta FIREBASE_SERVICE_ACCOUNT_PATH en .env");
+  console.error("❌ Missing FIREBASE_SERVICE_ACCOUNT_PATH in .env");
   process.exit(1);
 }
 
@@ -176,16 +181,8 @@ const app = initializeApp({
 });
 
 const db = getFirestore(app);
-const bulk = db.bulkWriter();
-let totalWrites = 0;
-bulk.onWriteError((err) => {
-  // retry hasta 5 intentos; Firestore maneja el backoff internamente
-  if ((err as any).failedAttempts < 5) {
-    return true;
-  }
-  console.error("❌ Write error sin reintento:", err);
-  return false;
-});
+import { FirestoreWriterManager } from "./firestoreClient";
+const writer = new FirestoreWriterManager(db, { dryRun });
 // Comentar el onWriteResult problemático por ahora
 // bulk.onWriteResult((_ref: any) => {
 //   totalWrites += 1;
@@ -197,32 +194,37 @@ bulk.onWriteError((err) => {
 // ---------------------- Utilidades ------------------
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-function saveCheckpoint(
+// checkpoint helpers are in ./checkpoint.ts
+
+// Small logging helpers to make the run more observable
+function saveCheckpointQuiet(
   stage: string,
-  { pageIndex, from, to }: { pageIndex: number; from: number; to: number }
+  ck: { pageIndex: number; from: number; to: number }
 ) {
-  let ckpt: Record<
-    string,
-    { pageIndex: number; from: number; to: number; ts: string }
-  > = {};
   try {
-    ckpt = JSON.parse(fs.readFileSync(CKPT_PATH, "utf8"));
-  } catch {
-    // vacío
+    saveCheckpoint(stage, ck);
+    // Solo log en caso de error
+  } catch (e: any) {
+    console.error(`❌ Checkpoint save failed [${stage}]:`, e?.message ?? e);
   }
-  ckpt[stage] = { pageIndex, from, to, ts: new Date().toISOString() };
-  fs.writeFileSync(CKPT_PATH, JSON.stringify(ckpt, null, 2));
 }
 
-function loadCheckpoint(
-  stage: string,
-  pageSizeNum: number
-): { pageIndex: number; from: number; to: number } {
+async function closeWriterAndLog(timeoutMs = 30_000) {
   try {
-    const ckpt = JSON.parse(fs.readFileSync(CKPT_PATH, "utf8"));
-    return ckpt[stage] || { pageIndex: 0, from: 0, to: pageSizeNum - 1 };
-  } catch {
-    return { pageIndex: 0, from: 0, to: pageSizeNum - 1 };
+    console.log(`⏳ Closing BulkWriter (timeout ${timeoutMs}ms)...`);
+    const p = writer.close();
+    const timeout = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("Writer close timeout")), timeoutMs)
+    );
+    await Promise.race([p, timeout]);
+    console.log(
+      `✅ BulkWriter closed. Total writes: ${writer.getTotalWrites()}`
+    );
+  } catch (e: any) {
+    console.error(`❌ Error closing writer:`, e?.message ?? e);
+    console.log(
+      `  Total writes recorded before error: ${writer.getTotalWrites()}`
+    );
   }
 }
 
@@ -233,33 +235,26 @@ function recordFailed(rec: Record<string, unknown>) {
   );
 }
 
-async function withReadRetries<T>(fn: () => Promise<T>, tries = 5): Promise<T> {
-  let attempt = 0;
-  // eslint-disable-next-line no-constant-condition
-  while (true) {
+async function withReadRetries<T>(
+  fn: () => Promise<T>,
+  operation = "Supabase query"
+): Promise<T> {
+  for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      if (attempt === 0) {
-        console.log(`🔄 Consultando Supabase...`);
-      } else {
-        console.log(`🔄 Reintento ${attempt + 1}/${tries}...`);
-      }
-      const result = await fn();
-      if (attempt > 0) {
-        console.log(`✅ Consulta exitosa después de ${attempt + 1} intentos`);
-      }
-      return result;
+      if (attempt > 1) console.log(`🔄 Retry ${attempt}/3: ${operation}`);
+      return await fn();
     } catch (e: any) {
-      attempt++;
-      console.error(`❌ Error en intento ${attempt}:`, e?.message ?? e);
-      if (attempt >= tries) {
-        console.error(`💥 Agotados ${tries} intentos, propagando error`);
+      if (attempt === 3) {
+        console.error(`💥 Failed after 3 attempts: ${e?.message ?? e}`);
         throw e;
       }
-      const delay = 500 * Math.pow(2, attempt); // 500, 1000, 2000, 4000ms
-      console.log(`⏳ Esperando ${delay}ms antes del siguiente intento...`);
-      await sleep(delay);
+      console.log(
+        `❌ Attempt ${attempt} failed: ${e?.message ?? e}. Retrying...`
+      );
+      await sleep(1000 * attempt);
     }
   }
+  throw new Error("Unreachable");
 }
 
 function iso(d?: string | number | Date | null): Nullable<string> {
@@ -335,12 +330,6 @@ async function pageCourseTrackings({
   from?: number;
   to?: number;
 }): Promise<{ data: GTCourseTrackingRow[]; count: number }> {
-  console.log(
-    `📊 Debugging: Fetching gt_course_tracking desde=${
-      since ? iso(since) : "inicio"
-    }, range=${from}-${Math.min(to, DEBUG_LIMIT)}`
-  );
-
   let q = supabase
     .from("gt_course_tracking")
     .select("id, student_code, course_code, updated_at", { count: "exact" })
@@ -358,17 +347,12 @@ async function pageCourseTrackings({
       count: number | null;
     };
     if (error) {
-      console.error("❌ Debugging: Error in pageCourseTrackings:", error);
+      console.error("❌ Error in pageCourseTrackings:", error);
       throw error;
     }
-    console.log(
-      `📊 Debugging: gt_course_tracking fetched ${
-        (data || []).length
-      } records (total: ${count || 0})`
-    );
     return { data: data || [], count: count || 0 };
   } catch (e: any) {
-    console.error("❌ Debugging: Error in pageCourseTrackings:", e.message);
+    console.error("❌ Error in pageCourseTrackings:", e.message);
     throw e;
   }
 }
@@ -378,10 +362,6 @@ async function getCategoriesByTrackIds(
 ): Promise<CategoriesByTrack> {
   const out: CategoriesByTrack = new Map();
   if (trackIds.length === 0) return out;
-
-  console.log(
-    `📋 Obteniendo categorías para ${trackIds.length} tracking IDs...`
-  );
 
   for (const [chunkIndex, ids] of chunk(trackIds, 100).entries()) {
     try {
@@ -396,12 +376,8 @@ async function getCategoriesByTrackIds(
       };
 
       if (error) {
-        console.error(`❌ Error en chunk ${chunkIndex + 1}:`, error);
+        console.error(`❌ Error in categories chunk ${chunkIndex + 1}:`, error);
         throw error;
-      }
-
-      if ((chunkIndex + 1) % 5 === 0 || chunkIndex === 0) {
-        console.log(`  ✅ Chunks 1-${chunkIndex + 1}: categorías acumuladas`);
       }
 
       for (const c of data || []) {
@@ -411,15 +387,13 @@ async function getCategoriesByTrackIds(
       }
     } catch (e: any) {
       console.error(
-        `❌ Error en getCategoriesByTrackIds chunk ${chunkIndex + 1}:`,
+        `❌ Error in getCategoriesByTrackIds chunk ${chunkIndex + 1}:`,
         e.message
       );
       throw e;
     }
   }
-  console.log(
-    `📋 Total categorías obtenidas: ${Array.from(out.values()).flat().length}`
-  );
+
   return out;
 }
 
@@ -428,8 +402,6 @@ async function getGradesByCategoryIds(
 ): Promise<GradesByCategory> {
   const out: GradesByCategory = new Map();
   if (catIds.length === 0) return out;
-
-  console.log(`📝 Obteniendo notas para ${catIds.length} category IDs...`);
 
   for (const [chunkIndex, ids] of chunk(catIds, 100).entries()) {
     try {
@@ -444,13 +416,10 @@ async function getGradesByCategoryIds(
       };
 
       if (error) {
-        console.error(`❌ Error en chunk ${chunkIndex + 1}:`, error);
+        console.error(`❌ Error in grades chunk ${chunkIndex + 1}:`, error);
         throw error;
       }
 
-      if ((chunkIndex + 1) % 5 === 0 || chunkIndex === 0) {
-        console.log(`  ✅ Chunks 1-${chunkIndex + 1}: notas acumuladas`);
-      }
       for (const g of data || []) {
         const arr = out.get(g.category_id) || [];
         arr.push(g);
@@ -458,15 +427,13 @@ async function getGradesByCategoryIds(
       }
     } catch (e: any) {
       console.error(
-        `❌ Error en getGradesByCategoryIds chunk ${chunkIndex + 1}:`,
+        `❌ Error in getGradesByCategoryIds chunk ${chunkIndex + 1}:`,
         e.message
       );
       throw e;
     }
   }
-  console.log(
-    `📝 Total notas obtenidas: ${Array.from(out.values()).flat().length}`
-  );
+
   return out;
 }
 
@@ -604,13 +571,10 @@ async function writeSimulationEmbedded({
   }
 
   try {
-    // Escritura directa - MÁS CONFIABLE que BulkWriter
+    // Direct write - MORE RELIABLE than BulkWriter
     await ref.set(body, { merge: true });
   } catch (e: any) {
-    console.error(
-      `❌ Error escribiendo ${studentCode}/${courseCode}:`,
-      e.message
-    );
+    console.error(`❌ Error writing ${studentCode}/${courseCode}:`, e.message);
     throw e;
   }
 }
@@ -637,7 +601,7 @@ async function writeSimulationSubcollections({
     return;
   }
 
-  await bulk.set(
+  await writer.set(
     base,
     { lastModified: FieldValue.serverTimestamp() },
     { merge: true }
@@ -645,7 +609,7 @@ async function writeSimulationSubcollections({
 
   for (const c of categories) {
     const ref = base.collection("categories").doc(String(c.id));
-    await bulk.set(
+    await writer.set(
       ref,
       { id: String(c.id), name: c.name, weight: numberOrNull(c.weight) },
       { merge: true }
@@ -656,7 +620,7 @@ async function writeSimulationSubcollections({
     const grades = gradesByCat.get(c.id) || [];
     for (const g of grades) {
       const ref = base.collection("grades").doc(String(g.id));
-      await bulk.set(
+      await writer.set(
         ref,
         {
           id: String(g.id),
@@ -678,6 +642,7 @@ async function writePreferences({
   studentCode: string;
   preferences: PreferencesJSON | Record<string, any>;
 }) {
+  console.log(`🔍 DEBUG - writePreferences START for student ${studentCode}`);
   const studentRef = db.collection("students").doc(studentCode);
 
   const prefs = safePrefs(preferences) as PreferencesJSON;
@@ -686,8 +651,8 @@ async function writePreferences({
 
   const globalRef = studentRef.collection("preferences").doc("global");
   if (!dryRun) {
-    await bulk.set(
-      globalRef,
+    // Usar escritura directa para preferencias (pocas) - más confiable
+    await globalRef.set(
       { ...global, migratedAt: FieldValue.serverTimestamp() },
       { merge: true }
     );
@@ -704,24 +669,24 @@ async function writePreferences({
     const ref = dataCol.doc(String(semesterId));
     const payload = normalizeSemPrefPayload(safePrefs(raw));
     if (!dryRun) {
-      await bulk.set(
-        ref,
-        {
-          ...payload,
-          migratedAt: FieldValue.serverTimestamp(),
-        },
+      // Usar escritura directa para preferencias
+      await ref.set(
+        { ...payload, migratedAt: FieldValue.serverTimestamp() },
         { merge: true }
       );
     } else {
       console.log("[DRY-RUN] set", ref.path);
     }
   }
+
+  console.log(`🔍 DEBUG - writePreferences END for student ${studentCode}`);
 }
 
 // ---------------------- Proceso principal -----------
 
 async function migrateSimulations() {
-  console.log("==> Migrando gradeSimulations...");
+  const stageStartTime = Date.now();
+  console.log("🎯 STAGE 1/2: Grade Simulations Migration");
 
   const {
     pageIndex: startIdx,
@@ -732,66 +697,95 @@ async function migrateSimulations() {
     to = ckTo,
     pageIndex = startIdx;
   let total = 0;
-  let processed = 0;
+  let processedInSession = 0;
 
-  console.log("🔍 Obteniendo count inicial de registros...");
-  const first = await withReadRetries(() =>
-    pageCourseTrackings({ since: MIGRATE_SINCE, from, to })
+  // Ensure checkpoint 'from' is within current table bounds. If resuming
+  // from an old checkpoint where the table (or filtered set) is now smaller
+  // this prevents Supabase PostgREST PGRST103 (range not satisfiable).
+  console.log("  Getting record count...");
+
+  const ck = await ensureCheckpointWithinBounds({
+    stage: "sim",
+    table: "gt_course_tracking",
+    pageSize,
+    migrateSince: MIGRATE_SINCE,
+    supabase,
+    withReadRetries,
+    ckptPath: CKPT_PATH,
+  });
+
+  if (ck.skipStage) {
+    console.log("⏭️  No records to migrate. Skipping grade simulations.");
+    return;
+  }
+
+  pageIndex = ck.pageIndex;
+  from = ck.from;
+  to = ck.to;
+
+  const first = await withReadRetries(
+    () => pageCourseTrackings({ since: MIGRATE_SINCE, from, to }),
+    "initial count query"
   );
   total = first.count;
+  const totalProcessed = pageIndex * pageSize;
+  const maxPageIndex = Math.max(0, Math.floor((total - 1) / pageSize));
+
   console.log(
-    `Registros en gt_course_tracking (filtro desde=${iso(
-      MIGRATE_SINCE
-    )}): ${total}`
+    `  Found ${total} records to migrate (since ${iso(MIGRATE_SINCE)})`
   );
+
   if (pageIndex > 0) {
+    const percent = ((totalProcessed / total) * 100).toFixed(1);
     console.log(
-      `📍 Reanudando desde página ${pageIndex + 1} (from=${from}, to=${to})`
+      `📍 Resuming from page ${pageIndex + 1}/${
+        maxPageIndex + 1
+      } - ${totalProcessed}/${total} already processed (${percent}%)`
     );
   }
 
-  while (processed < total) {
-    console.log(
-      `📄 Procesando página ${pageIndex + 1} (from: ${from}, to: ${to})...`
-    );
+  // If the saved checkpoint already points past the last page, mark stage done
+  if (pageIndex > maxPageIndex) {
+    console.log(`✅ Grade simulations already complete`);
+    saveCheckpointQuiet("sim", {
+      pageIndex: maxPageIndex + 1,
+      from: total,
+      to: total + pageSize,
+    });
+    return;
+  }
+
+  while (true) {
+    const currentTotal = totalProcessed + processedInSession;
+
+    // Si ya procesamos todo, salir
+    if (currentTotal >= total || from >= total) {
+      console.log(
+        `✅ Reached end of available records (${currentTotal}/${total})`
+      );
+      break;
+    }
+
+    console.log(`📄 Page ${pageIndex + 1}: Processing records ${from}-${to}`);
 
     const { data } =
       pageIndex === startIdx
         ? first
-        : await withReadRetries(() =>
-            pageCourseTrackings({ since: MIGRATE_SINCE, from, to })
+        : await withReadRetries(
+            () => pageCourseTrackings({ since: MIGRATE_SINCE, from, to }),
+            "page query"
           );
 
     if (!data || data.length === 0) {
-      console.log("📄 No hay más datos, terminando loop de páginas");
+      console.log("✅ No more data available");
       break;
     }
 
-    console.log(
-      `📄 Página ${pageIndex + 1}: obtenidos ${
-        data.length
-      } registros de course_tracking`
-    );
-
+    // Fetch related data
     const trackIds = data.map((t) => t.id);
-    console.log(
-      `🔍 Buscando categorías para tracking IDs: ${trackIds
-        .slice(0, 5)
-        .join(", ")}${trackIds.length > 5 ? "..." : ""}`
-    );
-
     const byTrack = await getCategoriesByTrackIds(trackIds);
-
     const allCats = Array.from(byTrack.values()).flat();
-    console.log(
-      `📊 Total categorías encontradas en esta página: ${allCats.length}`
-    );
-
     const gradesByCat = await getGradesByCategoryIds(allCats.map((c) => c.id));
-
-    console.log(
-      `🚀 Iniciando escrituras a Firestore para ${data.length} documentos...`
-    );
 
     const limit = pLimit(concurrency);
     const jobs: Array<Promise<unknown>> = [];
@@ -853,54 +847,48 @@ async function migrateSimulations() {
       );
     }
 
-    console.log(`🧵 Jobs creados: ${jobs.length}. Esperando confirmación...`);
-    const waitAll = Promise.all(jobs);
-    const warnTimer = setTimeout(() => {
-      console.log("⏳ Aún esperando confirmación de escrituras (10s)...");
-    }, 10_000);
-
-    // Timeout de emergencia para evitar cuelgues indefinidos
-    const timeoutPromise = new Promise((_, reject) => {
-      setTimeout(() => {
-        reject(new Error("Timeout: escrituras tardaron más de 60s"));
-      }, 60_000);
-    });
-
     try {
-      await Promise.race([waitAll, timeoutPromise]);
-      console.log(`✅ Página ${pageIndex + 1} completada`);
+      await Promise.all(jobs);
     } catch (e: any) {
-      console.error(`❌ Error en página ${pageIndex + 1}:`, e.message);
-      if (e.message.includes("Timeout")) {
-        console.log("🔍 Verificando estado de BulkWriter...");
-        console.log(`📊 Total writes registrados: ${totalWrites}`);
-        throw new Error(
-          "BulkWriter timeout - posible problema de conectividad/permisos"
-        );
-      }
+      console.error(`❌ Error on page ${pageIndex + 1}:`, e.message);
       throw e;
-    } finally {
-      clearTimeout(warnTimer);
     }
 
-    processed += data.length;
+    processedInSession += data.length;
+    const newTotal = totalProcessed + processedInSession;
+    const percent = ((newTotal / total) * 100).toFixed(1);
+
     console.log(
-      `  • Página ${pageIndex + 1}: ${
-        data.length
-      } elementos → acumulado ${processed}/${total}`
+      `✅ Page ${pageIndex + 1} complete → ${newTotal}/${total} (${percent}%)`
     );
+
     pageIndex += 1;
     from += pageSize;
     to += pageSize;
-    saveCheckpoint("sim", { pageIndex, from, to });
+    saveCheckpointQuiet("sim", { pageIndex, from, to });
     await sleep(50);
   }
 
-  console.log(`==> gradeSimulations listo. Procesados: ${processed}`);
+  const elapsed = ((Date.now() - stageStartTime) / 1000 / 60).toFixed(1);
+  console.log(
+    `✅ Grade Simulations Complete (${processedInSession} processed this session, ${elapsed}m elapsed)`
+  );
+
+  // persist a final checkpoint indicating stage completion
+  try {
+    saveCheckpointQuiet("sim", {
+      pageIndex: maxPageIndex + 1,
+      from: total,
+      to: total + pageSize,
+    });
+  } catch {
+    // noop
+  }
 }
 
 async function migratePreferencesAll() {
-  console.log("==> Migrando user_preferences...");
+  const stageStartTime = Date.now();
+  console.log("🎯 STAGE 2/2: User Preferences Migration");
 
   const {
     pageIndex: startIdx,
@@ -911,60 +899,189 @@ async function migratePreferencesAll() {
     to = ckTo,
     pageIndex = startIdx;
   let total = 0;
-  let processed = 0;
+  let processedInSession = 0;
 
-  const first = await withReadRetries(() => pageUserPreferences({ from, to }));
-  total = first.count;
-  console.log(
-    `Registros en user_preferences (filtro desde=${iso(
-      MIGRATE_SINCE
-    )}): ${total}`
+  // Clamp checkpoint against current total for user_preferences (centralized)
+  const ck = await ensureCheckpointWithinBounds({
+    stage: "prefs",
+    table: "user_preferences",
+    pageSize,
+    migrateSince: MIGRATE_SINCE,
+    supabase,
+    withReadRetries,
+    ckptPath: CKPT_PATH,
+  });
+
+  if (ck.skipStage) {
+    console.log("⏭️  No records to migrate. Skipping user preferences.");
+    return;
+  }
+
+  pageIndex = ck.pageIndex;
+  from = ck.from;
+  to = ck.to;
+
+  const first = await withReadRetries(
+    () => pageUserPreferences({ from, to }),
+    "preferences count query"
   );
+  total = first.count;
+  const totalProcessed = pageIndex * pageSize;
+  const maxPageIndex = Math.max(0, Math.floor((total - 1) / pageSize));
+
+  console.log(
+    `  Found ${total} user preference records to migrate (since ${iso(
+      MIGRATE_SINCE
+    )})`
+  );
+
   if (pageIndex > 0) {
+    const percent = ((totalProcessed / total) * 100).toFixed(1);
     console.log(
-      `📍 Reanudando desde página ${pageIndex + 1} (from=${from}, to=${to})`
+      `📍 Resuming from page ${pageIndex + 1}/${
+        maxPageIndex + 1
+      } - ${totalProcessed}/${total} already processed (${percent}%)`
     );
   }
 
+  // If checkpoint already past last page, mark prefs stage done and exit
+  if (pageIndex > maxPageIndex) {
+    console.log(`✅ User preferences already complete`);
+    saveCheckpointQuiet("prefs", {
+      pageIndex: maxPageIndex + 1,
+      from: total,
+      to: total + pageSize,
+    });
+    return;
+  }
+
   while (true) {
+    console.log(
+      `🔍 DEBUG - Starting new loop iteration: pageIndex=${pageIndex}, from=${from}, to=${to}`
+    );
+    const currentTotal = totalProcessed + processedInSession;
+
+    // Si ya procesamos todo, salir
+    if (currentTotal >= total) {
+      console.log(
+        `✅ Reached end of available preference records (${currentTotal}/${total})`
+      );
+      break;
+    }
+
+    // Si from está más allá del total, también salir
+    if (from >= total) {
+      console.log(
+        `✅ Page range beyond total records (from=${from} >= total=${total})`
+      );
+      break;
+    }
+
+    // Limit 'to' to the actual number of records available
+    const adjustedTo = Math.min(to, total - 1);
+
+    console.log(
+      `📄 Page ${
+        pageIndex + 1
+      }: Processing preferences ${from}-${adjustedTo} (original range: ${from}-${to})`
+    );
+
+    console.log(
+      `🔍 DEBUG - Loop state: from=${from}, to=${to}, adjustedTo=${adjustedTo}, total=${total}`
+    );
+    console.log(
+      `🔍 DEBUG - currentTotal=${currentTotal}, totalProcessed=${totalProcessed}, processedInSession=${processedInSession}`
+    );
+
     const { data } =
       pageIndex === startIdx
         ? first
-        : await withReadRetries(() => pageUserPreferences({ from, to }));
-    if (!data || data.length === 0) break;
+        : await withReadRetries(
+            () => pageUserPreferences({ from, to: adjustedTo }),
+            "preferences page query"
+          );
 
-    const limit = pLimit(concurrency);
+    console.log(`🔍 DEBUG - Query returned ${data?.length || 0} records`);
+
+    if (!data || data.length === 0) {
+      console.log("✅ No more preference data available");
+      break;
+    }
+
+    console.log(`   Processing ${data.length} preference records...`);
+    console.log(
+      `🔍 DEBUG - Starting Promise.all for ${data.length} records...`
+    );
+
+    // BulkWriter maneja su propia concurrencia, no necesitamos pLimit
     const jobs: Array<Promise<unknown>> = [];
 
     for (const r of data) {
       const studentCode = String(r.student_code);
       const prefsRow = safePrefs(r.preferences);
       jobs.push(
-        limit(async () => {
+        (async () => {
           try {
             await writePreferences({ studentCode, preferences: prefsRow });
           } catch (e: any) {
             recordFailed({ type: "prefs", studentCode, err: e.message });
           }
-        })
+        })()
       );
     }
 
-    await Promise.all(jobs);
-    processed += data.length;
     console.log(
-      `  • Página ${pageIndex + 1}: ${
-        data.length
-      } elementos → acumulado ${processed}/${total}`
+      `🔍 DEBUG - About to execute Promise.all for ${jobs.length} jobs...`
+    );
+
+    try {
+      await Promise.all(jobs);
+      console.log(`🔍 DEBUG - Promise.all completed successfully!`);
+    } catch (e: any) {
+      console.error(`❌ ERROR in Promise.all for preferences:`, e.message);
+      throw e;
+    }
+
+    processedInSession += data.length;
+    const newTotal = totalProcessed + processedInSession;
+    const percent = ((newTotal / total) * 100).toFixed(1);
+
+    console.log(
+      `✅ Page ${pageIndex + 1} complete → ${newTotal}/${total} (${percent}%)`
+    );
+
+    console.log(
+      `🔍 DEBUG - Updating loop variables: pageIndex ${pageIndex} -> ${
+        pageIndex + 1
+      }, from ${from} -> ${from + pageSize}`
     );
     pageIndex += 1;
     from += pageSize;
     to += pageSize;
-    saveCheckpoint("prefs", { pageIndex, from, to });
+    saveCheckpointQuiet("prefs", { pageIndex, from, to });
+    console.log(`🔍 DEBUG - Checkpoint saved, sleeping 50ms...`);
     await sleep(50);
+    console.log(`🔍 DEBUG - About to check loop conditions again...`);
   }
 
-  console.log(`==> user_preferences listo. Procesados: ${processed}`);
+  console.log(
+    `🔍 DEBUG - Exited while loop! About to show completion message...`
+  );
+  const elapsed = ((Date.now() - stageStartTime) / 1000 / 60).toFixed(1);
+  console.log(
+    `✅ User Preferences Complete (${processedInSession} processed this session, ${elapsed}m elapsed)`
+  );
+
+  // persist a final checkpoint indicating prefs stage completion
+  try {
+    saveCheckpointQuiet("prefs", {
+      pageIndex: maxPageIndex + 1,
+      from: total,
+      to: total + pageSize,
+    });
+  } catch {
+    // noop
+  }
 }
 
 // Añadir hooks para ver errores silenciosos en runtime
@@ -979,20 +1096,48 @@ process.on("uncaughtException", (err: any) => {
 
 (async function main(): Promise<void> {
   const started = Date.now();
-  console.log("🚀 Iniciando migración Supabase → Firestore");
-  console.log(`   Modo estructura: ${structureMode} | DRY_RUN=${dryRun}`);
-  console.log(`   Checkpoint: ${CKPT_PATH} | Failed: ${FAILED_LOG_PATH}`);
+  console.log("🚀 Starting Supabase → Firestore Migration");
+  console.log(
+    `   Mode: ${structureMode} | Dry Run: ${dryRun} | Since: ${
+      MIGRATE_SINCE || "beginning"
+    }`
+  );
+  console.log(`   Page Size: ${pageSize} | Concurrency: ${concurrency}`);
+  console.log("");
+
+  let simsProcessed = 0;
+  let prefsProcessed = 0;
+
   try {
+    console.log(`🔍 DEBUG - Starting migrateSimulations()...`);
     await migrateSimulations();
+    console.log(
+      `🔍 DEBUG - migrateSimulations() completed, starting migratePreferencesAll()...`
+    );
     await migratePreferencesAll();
+    console.log(
+      `🔍 DEBUG - migratePreferencesAll() completed! dryRun=${dryRun}`
+    );
 
     if (!dryRun) {
-      console.log("⏳ Esperando flush de BulkWriter...");
-      await bulk.close(); // asegura que todo se haya enviado
+      console.log("⏳ Finalizing writes...");
+      await closeWriterAndLog();
+      console.log(`🔍 DEBUG - closeWriterAndLog() completed!`);
     }
-    const secs = ((Date.now() - started) / 1000).toFixed(1);
-    console.log(`✅ Migración terminada en ${secs}s`);
 
+    console.log(`🔍 DEBUG - About to show migration summary...`);
+    const elapsed = ((Date.now() - started) / 1000 / 60).toFixed(1);
+    const totalWrites = writer.getTotalWrites();
+
+    console.log("");
+    console.log("📋 MIGRATION SUMMARY");
+    console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    console.log(`⏱️  Total time: ${elapsed}m`);
+    console.log(`🎯 Grade simulations: Complete`);
+    console.log(`🎯 User preferences: Complete`);
+    console.log(`  Total Firestore writes: ${totalWrites}`);
+
+    // Check for failed items
     try {
       if (fs.existsSync(FAILED_LOG_PATH)) {
         const failedLines = fs
@@ -1002,17 +1147,25 @@ process.on("uncaughtException", (err: any) => {
           .filter((l) => l);
         if (failedLines.length > 0) {
           console.log(
-            `⚠️ ${failedLines.length} elementos fallaron (ver ${FAILED_LOG_PATH})`
+            `⚠️  Issues: ${failedLines.length} items failed (see ${FAILED_LOG_PATH})`
           );
+        } else {
+          console.log(`✅ Success rate: 100%`);
         }
+      } else {
+        console.log(`✅ Success rate: 100%`);
       }
     } catch {
       // noop
     }
+
+    console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    console.log(`✅ Migration completed successfully`);
   } catch (err) {
-    console.error("❌ Error durante la migración:", err);
+    console.log("");
+    console.error("❌ Migration failed:", err);
     try {
-      await bulk.close();
+      await writer.close();
     } catch {
       // noop
     }

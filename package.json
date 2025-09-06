@@ -10,9 +10,9 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
-    "@supabase/supabase-js": "^2.54.0",
-    "dotenv": "^17.2.1",
-    "firebase-admin": "^13.4.0",
-    "p-limit": "^6.2.0"
+    "@supabase/supabase-js": "^2.57.2",
+    "dotenv": "^17.2.2",
+    "firebase-admin": "^13.5.0",
+    "p-limit": "^7.1.1"
   }
 }
