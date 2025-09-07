@@ -152,11 +152,12 @@ const structureMode: StructureMode =
 // Permite desactivar el límite estableciendo DEBUG_LIMIT (p. ej. 500) o sin límite
 const DEBUG_LIMIT: number = process.env.DEBUG_LIMIT
   ? Math.max(1, parseInt(process.env.DEBUG_LIMIT, 10))
-  : (Infinity as number);
+  : (Infinity as number); // ✅ Volver al comportamiento normal
 
 // Rutas locales
 const CKPT_PATH = CHECKPOINT_PATH || "./checkpoint.json";
 const FAILED_LOG_PATH = FAILED_PATH || "./failed.jsonl";
+const ISSUES_LOG_PATH = "./issues.jsonl"; // Nuevo: problemas de integridad
 
 // ---------------------- SDKs ------------------------
 const supabase: SupabaseClient = createClient(
@@ -181,6 +182,34 @@ const app = initializeApp({
 });
 
 const db = getFirestore(app);
+
+// Test Firebase connection immediately
+console.log("🔍 Testing Firebase connection...");
+try {
+  const testRef = db.collection("_test").doc("connection-test");
+  console.log(`🔍 Firebase initialized successfully`);
+  console.log(`   Project ID: ${serviceAccount.project_id}`);
+  // console.log(`   Database: ${db._settings?.databaseId || 'default'}`);
+
+  // Try a simple write to test permissions
+  if (!dryRun) {
+    await testRef.set({
+      timestamp: FieldValue.serverTimestamp(),
+      testMessage: "Migration script connection test",
+    });
+    console.log(`✅ Firebase write permissions confirmed`);
+
+    // Clean up test document
+    await testRef.delete();
+    console.log(`🧹 Test document cleaned up`);
+  } else {
+    console.log(`ℹ️ Dry run mode - skipping connection test write`);
+  }
+} catch (e: any) {
+  console.error(`❌ Firebase connection/permissions error:`, e.message);
+  console.error(`   Code: ${e.code}`);
+  throw e;
+}
 import { FirestoreWriterManager } from "./firestoreClient";
 const writer = new FirestoreWriterManager(db, { dryRun });
 // Comentar el onWriteResult problemático por ahora
@@ -232,6 +261,17 @@ function recordFailed(rec: Record<string, unknown>) {
   fs.appendFileSync(
     FAILED_LOG_PATH,
     JSON.stringify({ ...rec, ts: new Date().toISOString() }) + "\n"
+  );
+}
+
+function recordIssue(rec: Record<string, unknown>) {
+  fs.appendFileSync(
+    ISSUES_LOG_PATH,
+    JSON.stringify({ ...rec, ts: new Date().toISOString() }) + "\n"
+  );
+  // También log en consola, pero menos verbose
+  console.log(
+    `⚠️ ISSUE: ${rec.type} - ${rec.studentCode}/${rec.courseCode || "N/A"}`
   );
 }
 
@@ -334,7 +374,7 @@ async function pageCourseTrackings({
     .from("gt_course_tracking")
     .select("id, student_code, course_code, updated_at", { count: "exact" })
     .order("updated_at", { ascending: true })
-    .range(from, Math.min(to, DEBUG_LIMIT));
+    .range(from, to);
 
   if (since) {
     q = q.gte("updated_at", since);
@@ -545,14 +585,21 @@ function normalizeSemPrefPayload<T extends Record<string, any>>(
   return out as T & { scheduleHiddenEvents?: unknown[] };
 }
 
+// Global counters
+let totalDirectWrites = 0;
+let skippedExistingDocs = 0;
+let newDocsCreated = 0;
+
 async function writeSimulationEmbedded({
   studentCode,
   courseCode,
   payload,
+  originalCreatedAt,
 }: {
   studentCode: string;
   courseCode: string;
   payload: { categories: Record<string, any>; grades: Record<string, any> };
+  originalCreatedAt?: string;
 }) {
   const ref = db
     .collection("students")
@@ -563,7 +610,18 @@ async function writeSimulationEmbedded({
   const body = {
     ...payload,
     lastModified: FieldValue.serverTimestamp(),
+    // Preservar la fecha de creación original si existe
+    ...(originalCreatedAt && { createdAt: new Date(originalCreatedAt) }),
   };
+
+  // Solo log cada 10 intentos para reducir ruido
+  const shouldLog = (totalDirectWrites + skippedExistingDocs) % 10 === 0;
+
+  if (shouldLog) {
+    console.log(`🔍 WRITE ATTEMPT: ${ref.path}`);
+    console.log(`   Categories: ${Object.keys(payload.categories).length}`);
+    console.log(`   Grades: ${Object.keys(payload.grades).length}`);
+  }
 
   if (dryRun) {
     console.log("[DRY-RUN] set", ref.path);
@@ -571,10 +629,45 @@ async function writeSimulationEmbedded({
   }
 
   try {
+    // Check if document already exists
+    const existing = await ref.get();
+    if (existing.exists) {
+      skippedExistingDocs++;
+      if (shouldLog) {
+        console.log(
+          `⏭️ ALREADY EXISTS: ${ref.path} [Skipped: ${skippedExistingDocs}]`
+        );
+      }
+      return;
+    }
+
+    if (shouldLog) {
+      console.log(`⏳ EXECUTING: ref.set() for ${studentCode}/${courseCode}`);
+    }
+    const startTime = Date.now();
+
     // Direct write - MORE RELIABLE than BulkWriter
-    await ref.set(body, { merge: true });
+    await ref.set(body, { merge: false }); // No merge - new doc only
+
+    const elapsed = Date.now() - startTime;
+    totalDirectWrites++;
+    newDocsCreated++;
+
+    if (shouldLog || newDocsCreated % 50 === 0) {
+      console.log(
+        `✅ NEW DOC CREATED: ${ref.path} (${elapsed}ms) [New: ${newDocsCreated}, Total: ${totalDirectWrites}]`
+      );
+    }
+
+    // Log every 50 writes
+    if (totalDirectWrites % 50 === 0) {
+      console.log(`🎯 MILESTONE: ${totalDirectWrites} direct writes completed`);
+    }
   } catch (e: any) {
-    console.error(`❌ Error writing ${studentCode}/${courseCode}:`, e.message);
+    console.error(`❌ WRITE FAILED: ${ref.path}`);
+    console.error(`   Error: ${e.message}`);
+    console.error(`   Code: ${e.code}`);
+    console.error(`   Details: ${JSON.stringify(e.details || {})}`);
     throw e;
   }
 }
@@ -642,7 +735,7 @@ async function writePreferences({
   studentCode: string;
   preferences: PreferencesJSON | Record<string, any>;
 }) {
-  console.log(`🔍 DEBUG - writePreferences START for student ${studentCode}`);
+  console.log(`🔍 PREF WRITE START: student ${studentCode}`);
   const studentRef = db.collection("students").doc(studentCode);
 
   const prefs = safePrefs(preferences) as PreferencesJSON;
@@ -650,12 +743,29 @@ async function writePreferences({
   const semestersData = (prefs._semesters && prefs._semesters.data) || {};
 
   const globalRef = studentRef.collection("preferences").doc("global");
+
+  console.log(`🔍 WRITING GLOBAL PREFS: ${globalRef.path}`);
+  console.log(`   Global keys: ${Object.keys(global).length}`);
+  console.log(`   Semesters: ${Object.keys(semestersData).length}`);
+
   if (!dryRun) {
-    // Usar escritura directa para preferencias (pocas) - más confiable
-    await globalRef.set(
-      { ...global, migratedAt: FieldValue.serverTimestamp() },
-      { merge: true }
-    );
+    try {
+      const startTime = Date.now();
+      // Usar escritura directa para preferencias (pocas) - más confiable
+      await globalRef.set(
+        { ...global, migratedAt: FieldValue.serverTimestamp() },
+        { merge: true }
+      );
+      const elapsed = Date.now() - startTime;
+      totalDirectWrites++;
+      console.log(
+        `✅ GLOBAL PREFS SUCCESS: ${globalRef.path} (${elapsed}ms) [Total: ${totalDirectWrites}]`
+      );
+    } catch (e: any) {
+      console.error(`❌ GLOBAL PREFS FAILED: ${globalRef.path}`);
+      console.error(`   Error: ${e.message}`);
+      throw e;
+    }
   } else {
     console.log("[DRY-RUN] set", globalRef.path);
   }
@@ -668,18 +778,33 @@ async function writePreferences({
   for (const [semesterId, raw] of Object.entries(semestersData)) {
     const ref = dataCol.doc(String(semesterId));
     const payload = normalizeSemPrefPayload(safePrefs(raw));
+
+    console.log(`🔍 WRITING SEM PREFS: ${ref.path}`);
+
     if (!dryRun) {
-      // Usar escritura directa para preferencias
-      await ref.set(
-        { ...payload, migratedAt: FieldValue.serverTimestamp() },
-        { merge: true }
-      );
+      try {
+        const startTime = Date.now();
+        // Usar escritura directa para preferencias
+        await ref.set(
+          { ...payload, migratedAt: FieldValue.serverTimestamp() },
+          { merge: true }
+        );
+        const elapsed = Date.now() - startTime;
+        totalDirectWrites++;
+        console.log(
+          `✅ SEM PREFS SUCCESS: ${ref.path} (${elapsed}ms) [Total: ${totalDirectWrites}]`
+        );
+      } catch (e: any) {
+        console.error(`❌ SEM PREFS FAILED: ${ref.path}`);
+        console.error(`   Error: ${e.message}`);
+        throw e;
+      }
     } else {
       console.log("[DRY-RUN] set", ref.path);
     }
   }
 
-  console.log(`🔍 DEBUG - writePreferences END for student ${studentCode}`);
+  console.log(`🔍 PREF WRITE END: student ${studentCode}`);
 }
 
 // ---------------------- Proceso principal -----------
@@ -698,6 +823,12 @@ async function migrateSimulations() {
     pageIndex = startIdx;
   let total = 0;
   let processedInSession = 0;
+
+  // Contadores para validación de completitud
+  let totalCategories = 0;
+  let totalGrades = 0;
+  let coursesWithoutCategories = 0;
+  let categoriesWithoutGrades = 0;
 
   // Ensure checkpoint 'from' is within current table bounds. If resuming
   // from an old checkpoint where the table (or filtered set) is now smaller
@@ -794,6 +925,37 @@ async function migrateSimulations() {
       const studentCode = String(t.student_code);
       const courseCode = String(t.course_code);
       const categories = byTrack.get(t.id) || [];
+
+      // Validación de integridad
+      if (categories.length === 0) {
+        coursesWithoutCategories++;
+        recordIssue({
+          type: "no_categories",
+          studentCode,
+          courseCode,
+          trackingId: t.id,
+        });
+      }
+
+      totalCategories += categories.length;
+
+      // Contar grades y validar integridad referencial
+      let courseGrades = 0;
+      for (const cat of categories) {
+        const grades = gradesByCat.get(cat.id) || [];
+        if (grades.length === 0) {
+          categoriesWithoutGrades++;
+          recordIssue({
+            type: "category_no_grades",
+            studentCode,
+            courseCode,
+            categoryId: cat.id,
+            categoryName: cat.name,
+          });
+        }
+        courseGrades += grades.length;
+      }
+      totalGrades += courseGrades;
 
       jobs.push(
         limit(async () => {
@@ -1135,7 +1297,38 @@ process.on("uncaughtException", (err: any) => {
     console.log(`⏱️  Total time: ${elapsed}m`);
     console.log(`🎯 Grade simulations: Complete`);
     console.log(`🎯 User preferences: Complete`);
-    console.log(`  Total Firestore writes: ${totalWrites}`);
+    console.log(`📊 NEW documents created: ${newDocsCreated}`);
+    console.log(`📊 EXISTING documents skipped: ${skippedExistingDocs}`);
+    console.log(`📊 Direct writes executed: ${totalDirectWrites}`);
+    console.log(`📊 BulkWriter writes: ${totalWrites}`);
+
+    // Check for issues
+    const issuesExist = fs.existsSync(ISSUES_LOG_PATH);
+    if (issuesExist) {
+      const issueLines = fs
+        .readFileSync(ISSUES_LOG_PATH, "utf8")
+        .trim()
+        .split("\n")
+        .filter((l) => l);
+      console.log(
+        `⚠️  Data integrity issues: ${issueLines.length} (see issues.jsonl)`
+      );
+
+      // Summary of issue types
+      const issueTypes: Record<string, number> = {};
+      issueLines.forEach((line) => {
+        try {
+          const issue = JSON.parse(line);
+          issueTypes[issue.type] = (issueTypes[issue.type] || 0) + 1;
+        } catch {}
+      });
+
+      Object.entries(issueTypes).forEach(([type, count]) => {
+        console.log(`   ${type}: ${count}`);
+      });
+    } else {
+      console.log(`✅ Data integrity: Perfect`);
+    }
 
     // Check for failed items
     try {

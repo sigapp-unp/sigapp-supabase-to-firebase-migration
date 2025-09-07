@@ -27,7 +27,7 @@ bun.lock
 
 # Migration checkpoint files
 *checkpoint.json*
-failed.jsonl
+*.jsonl
 
 # Build outputs
 dist/
